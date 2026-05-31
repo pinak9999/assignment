@@ -6,7 +6,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { fileURLToPath } from "url";
+
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
@@ -14,8 +14,8 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // Fixes for ESModule paths in Node
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// CommonJS / Render compatible path handling
+const __dirname = process.cwd();
 
 const app = express();
 const PORT = 3000;
