@@ -29,12 +29,15 @@ import UploadZone from "./components/UploadZone";
 import QuerySearch from "./components/QuerySearch";
 import Dashboard from "./components/Dashboard";
 import ImageGallery from "./components/ImageGallery";
+import ModelConfig from "./components/ModelConfig";
 
 export default function App() {
   const [records, setRecords] = useState<AnimalRecord[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [isDocsOpen, setIsDocsOpen] = useState(false);
+  const [modelConfig, setModelConfig] = useState<any>(null);
+  const [lastClassification, setLastClassification] = useState<any>(null);
 
   // Default Search filters state
   const [filters, setFilters] = useState<SearchFilters>({
@@ -55,6 +58,22 @@ export default function App() {
       // Default to crisp light theme for maximum color contrast and accessibility
       document.documentElement.classList.remove("dark");
     }
+  }, []);
+
+  // Load model configuration from server
+  useEffect(() => {
+    const loadModelConfig = async () => {
+      try {
+        const response = await fetch("/api/model/config");
+        if (response.ok) {
+          const data = await response.json();
+          setModelConfig(data.config);
+        }
+      } catch (error) {
+        console.error("Failed to load model config:", error);
+      }
+    };
+    loadModelConfig();
   }, []);
 
   // Theme toggle helper
@@ -85,6 +104,15 @@ export default function App() {
 
   // Callback when an image is successfully preprocessed & classified by the queue
   const handleRecordProcessed = async (newRecord: AnimalRecord, fileBlob: Blob) => {
+    // Track last classification for model config display
+    setLastClassification({
+      animalName: newRecord.animalName,
+      category: newRecord.category,
+      confidence: newRecord.confidence,
+      predictions: newRecord.predictions,
+      detections: newRecord.detections,
+    });
+
     // 1. Write original image + classification meta to client IndexedDB
     await saveImageRecord(newRecord, fileBlob);
 
@@ -324,11 +352,11 @@ export default function App() {
               <h1 className="text-sm font-black tracking-tight flex items-center gap-1.5 leading-none bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-350">
                 ZooLogic AI Archive
                 <span className="text-[9px] font-bold text-cyan-300 bg-cyan-500/20 px-1.5 py-0.5 rounded-full uppercase border border-cyan-500/30 font-mono">
-                  Engine Active
+                  ML Active
                 </span>
               </h1>
               <p className="text-[10px] text-slate-400 font-semibold font-mono">
-                Gemini Multi-Specimen Neural Identifier
+                YOLOv8 Detection + EfficientNet-B7 Classification
               </p>
             </div>
           </div>
@@ -405,8 +433,6 @@ export default function App() {
                     <li>Extract ZIP deliverables or clone repository directory workspace</li>
                     <li>Ensure <span className="font-semibold text-white">Node.js 18+</span> is pre-installed locally</li>
                     <li>Install base modules: <code className="px-1 py-0.5 bg-white/10 rounded font-mono text-[10px] border border-white/5">npm install</code></li>
-                    <li>Provide your Gemini Secret API key in terminal environment: <br />
-                      <code className="px-1 py-0.5 bg-white/10 rounded font-mono text-[10px] border border-white/5">export GEMINI_API_KEY="YOUR_KEY"</code></li>
                     <li>Start development server: <code className="px-1 py-0.5 bg-white/10 rounded font-mono text-[10px] border border-white/5">npm run dev</code></li>
                     <li>Open browser at <span className="font-semibold font-mono text-cyan-400">http://localhost:3000</span></li>
                   </ol>
@@ -418,10 +444,11 @@ export default function App() {
                     Backend API Specifications
                   </h3>
                   <ul className="list-disc pl-4 space-y-1 font-sans font-medium">
-                    <li><code className="text-cyan-400 font-bold">POST /api/classify</code> : Receives base64 image data payload and queries Gemini, yielding classification JSON.</li>
+                    <li><code className="text-cyan-400 font-bold">POST /api/classify</code> : YOLOv8+EfficientNet: analyzes image, returns predictions & confidence.</li>
+                    <li><code className="text-cyan-400 font-bold">GET /api/model/config</code> : Retrieves current detection/classification thresholds.</li>
+                    <li><code className="text-cyan-400 font-bold">POST /api/model/config</code> : Updates model confidence thresholds (min 70%).</li>
                     <li><code className="text-cyan-400 font-bold">GET /api/images</code> : Serves full metadata collection arrays for synchronization.</li>
-                    <li><code className="text-cyan-400 font-bold">POST /api/images</code> : Saves or updates a taxonomy metadata record in SQLite-like disk db.</li>
-                    <li><code className="text-cyan-400 font-bold">DELETE /api/images/:id</code> : Clears a matching metadata item.</li>
+                    <li><code className="text-cyan-400 font-bold">POST /api/images</code> : Saves or updates a taxonomy metadata record.</li>
                   </ul>
                 </div>
               </div>
@@ -443,6 +470,13 @@ export default function App() {
           onQueueComplete={handleQueueComplete}
           isProcessing={isProcessing}
           setIsProcessing={setIsProcessing}
+        />
+
+        {/* Model Configuration & Top Predictions */}
+        <ModelConfig
+          currentConfig={modelConfig}
+          onConfigUpdate={setModelConfig}
+          lastClassification={lastClassification}
         />
 
         {/* Search taxonomy inputs */}

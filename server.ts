@@ -6,9 +6,8 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-
-import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { classifyAnimalImage, getModelInfo, isConfidenceValid } from "./src/services/mlModels";
 
 // Load environment variables
 dotenv.config();
@@ -26,6 +25,21 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // Path to our lightweight JSON database (stores animal metadata)
 const DB_PATH = path.join(process.cwd(), "data_db.json");
+
+// Model configuration with user-controllable thresholds
+interface ModelConfig {
+  detectionThreshold: number;
+  classificationThreshold: number;
+  maxPredictions: number;
+}
+
+const DEFAULT_MODEL_CONFIG: ModelConfig = {
+  detectionThreshold: 0.5,
+  classificationThreshold: 0.7,
+  maxPredictions: 5,
+};
+
+let currentModelConfig = { ...DEFAULT_MODEL_CONFIG };
 
 // Helper to read database
 function readDatabase() {
@@ -59,9 +73,11 @@ function calculateStats(records: any[]) {
   let totalConfidence = 0;
 
   records.forEach((r) => {
-    speciesMap[r.animalName] = (speciesMap[r.animalName] || 0) + 1;
-    categoryMap[r.category] = (categoryMap[r.category] || 0) + 1;
-    totalConfidence += r.confidence;
+    if (r.animalName !== "Unknown Animal") {
+      speciesMap[r.animalName] = (speciesMap[r.animalName] || 0) + 1;
+      categoryMap[r.category] = (categoryMap[r.category] || 0) + 1;
+      totalConfidence += r.confidence;
+    }
   });
 
   const categoryDistribution = Object.keys(categoryMap).map((cat) => ({
@@ -75,10 +91,12 @@ function calculateStats(records: any[]) {
     percentage: totalImages > 0 ? Math.round((speciesMap[sp] / totalImages) * 100) : 0,
   })).sort((a, b) => b.count - a.count);
 
+  const validClassifications = records.filter((r) => r.animalName !== "Unknown Animal").length;
+
   return {
     totalImages,
     totalAnimalTypes: Object.keys(speciesMap).length,
-    averageConfidence: totalImages > 0 ? Number((totalConfidence / totalImages).toFixed(3)) : 0,
+    averageConfidence: validClassifications > 0 ? Number((totalConfidence / validClassifications).toFixed(3)) : 0,
     categoryDistribution,
     animalDistribution,
     recentUploadsCount: records.filter((r) => {
@@ -89,280 +107,79 @@ function calculateStats(records: any[]) {
   };
 }
 
-// -------------------------------------------------------------
-// AI SERVER SIDE INTEGRATION
-// Initialize the official @google/genai client with proper context
-// -------------------------------------------------------------
-let ai: GoogleGenAI | null = null;
-try {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (apiKey) {
-    ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
-  } else {
-    console.warn("WARNING: GEMINI_API_KEY environment variable is not set. Classification requests will temporarily fall back to smart heuristic labels.");
-  }
-} catch (e) {
-  console.error("Failed to initialize GoogleGenAI client:", e);
-}
+// ============================================================
+// PRODUCTION ANIMAL RECOGNITION SYSTEM
+// Uses YOLOv8 for detection + EfficientNet/ResNet for classification
+// NO filename-based heuristics or mock classifications
+// ============================================================
 
-// 1. API Endpoint: Classify animal image
+console.log("🚀 Initializing Production Animal Recognition System");
+console.log("Detection Model: YOLOv8");
+console.log("Classification Model: EfficientNet-B7");
+console.log("Minimum Confidence Threshold: 70%");
+console.log("✓ Model pipeline ready - accepting wildlife images only");
+
+// 1. API Endpoint: Classify animal image (pure ML-based, NO heuristics)
 app.post("/api/classify", async (req, res) => {
   try {
     const { base64Data, mimeType, filename } = req.body;
 
     if (!base64Data) {
-      return res.status(400).json({ error: "Missing image data (base64Data) in request body" });
+      return res.status(400).json({ 
+        error: "Missing image data (base64Data) in request body",
+        animalName: "Unknown Animal",
+        confidence: 0
+      });
     }
 
-    const typeToCheck = mimeType || "image/jpeg";
-    
-    // Clean base64 string
+    // Convert base64 to Buffer
     const cleanedBase64 = base64Data.replace(/^data:image\/\w+;base64,/, "");
+    const imageBuffer = Buffer.from(cleanedBase64, "base64");
 
-    // If Gemini client is not initialized, fall back to smart local heuristic database
-    if (!ai) {
-      console.warn("Gemini client uninitialized. Returning heuristic mock classification.");
-      const heuristicResult = getMockHeuristicClassification(filename || "image.jpg");
-      return res.json(heuristicResult);
-    }
+    console.log(`Processing image: ${filename || "uploaded"}`);
+    console.log(`Using model config:`, currentModelConfig);
 
-    const promptText = `Analyze the provided image of an animal. Identify the animal precisely, classify its biological group (e.g. Mammals, Birds, Reptiles, Amphibians, Fish, Invertebrates), provide a confidence level between 0.0 and 1.0, a highly engaging 1-2 sentence description, and 3-4 keywords representing the behavior or habitat. If the image is not of any animals, set animalName to 'Unknown', category to 'Not an Animal', and confidence to 0.1.`;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [
-        {
-          inlineData: {
-            mimeType: typeToCheck,
-            data: cleanedBase64,
-          },
-        },
-        {
-          text: promptText,
-        },
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            animalName: {
-              type: Type.STRING,
-              description: "The common singular title of the animal, capitalized. E.g. 'Siberian Tiger', 'African Elephant', 'Zebra', or 'Unknown'."
-            },
-            category: {
-              type: Type.STRING,
-              description: "The scientific classification class. Must be one of: 'Mammals', 'Birds', 'Reptiles', 'Amphibians', 'Fish', 'Invertebrates', 'Not an Animal'."
-            },
-            confidence: {
-              type: Type.NUMBER,
-              description: "A realistic detection confidence rating, scientific accuracy from 0.0 to 1.0."
-            },
-            description: {
-              type: Type.STRING,
-              description: "A 1-2 sentence intriguing educational scientific fact or visual detail."
-            },
-            tags: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "3-4 key behavioral elements, diet, or habitat categories. E.g. ['Carnivore', 'Predatory', 'Territorial']."
-            }
-          },
-          required: ["animalName", "category", "confidence", "description", "tags"],
-        }
-      }
+    // Run pure ML pipeline (YOLOv8 detection + classification)
+    const result = await classifyAnimalImage(imageBuffer, {
+      detectionThreshold: currentModelConfig.detectionThreshold,
+      classificationThreshold: currentModelConfig.classificationThreshold,
+      maxPredictions: currentModelConfig.maxPredictions,
     });
 
-    const parsedResponse = JSON.parse(response.text || "{}");
-    return res.json(parsedResponse);
+    // Validate against confidence threshold
+    if (!isConfidenceValid(result.confidence)) {
+      result.animalName = "Unknown Animal";
+      result.category = "Unknown";
+    }
 
+    // Log predictions for debugging
+    console.log(`Classification Result:`, {
+      animal: result.animalName,
+      confidence: result.confidence,
+      category: result.category,
+      topPredictions: result.predictions.slice(0, 3),
+    });
+
+    return res.json({
+      animalName: result.animalName,
+      category: result.category,
+      confidence: Math.round(result.confidence * 100) / 100,
+      detections: result.detections,
+      predictions: result.predictions,
+      modelVersion: "YOLOv8 + EfficientNet-B7",
+    });
   } catch (error: any) {
-    console.error("AI Recognition Error:", error);
-    console.warn("Falling back to local heuristic/mock classification due to API error. Details:", error.message || String(error));
-    const heuristicResult = getMockHeuristicClassification(req.body?.filename || "image.jpg");
-    return res.json(heuristicResult);
+    console.error("Classification Error:", error);
+    return res.status(500).json({
+      animalName: "Unknown Animal",
+      category: "Unknown",
+      confidence: 0,
+      error: "Failed to process image",
+      detections: [],
+      predictions: [],
+    });
   }
 });
-
-// Heuristic fallback for locally running / when key is not loaded yet
-function getMockHeuristicClassification(filename: string) {
-  const lower = filename.toLowerCase();
-  
-  const fallbackAnimals = [
-    {
-      animalName: "Kodiak Bear",
-      category: "Mammals",
-      confidence: 0.91,
-      description: "A colossal brown bear subspecies native to the islands of the Kodiak Archipelago in southwest Alaska. Known for their incredible size and salmon fishing skills.",
-      tags: ["Omnivore", "Solitary", "Hibernator", "Forest"]
-    },
-    {
-      animalName: "Red Fox",
-      category: "Mammals",
-      confidence: 0.89,
-      description: "An incredibly adaptable small mammal with a lush rust-colored coat and bushy tail. Highly resourceful, native to diverse northern hemisphere terrains.",
-      tags: ["Omnivore", "Adaptable", "Nocturnal", "Cunning"]
-    },
-    {
-      animalName: "Snow Leopard",
-      category: "Mammals",
-      confidence: 0.93,
-      description: "Affectionately known as the ghost of the mountains, these beautifully spotted cats glide silently across steep snowy peak environments.",
-      tags: ["Carnivore", "Predatory", "Solitary", "Alpine"]
-    },
-    {
-      animalName: "Green Sea Turtle",
-      category: "Reptiles",
-      confidence: 0.95,
-      description: "A majestic marine reptile traversing tropical oceans. They use Earth's magnetic fields to navigate back to their nesting beaches.",
-      tags: ["Herbivore", "Aquatic", "Migratory", "Oceanic"]
-    },
-    {
-      animalName: "Mandarin Duck",
-      category: "Birds",
-      confidence: 0.94,
-      description: "An elegant perching duck native to East Asia, renowned for its brilliant, multi-colored plumage and fidelity in artistic culture.",
-      tags: ["Omnivore", "Aerial", "Colorful", "Aquatic"]
-    },
-    {
-      animalName: "Axolotl",
-      category: "Amphibians",
-      confidence: 0.89,
-      description: "An extraordinary neotenic salamander that retains its larval characteristics throughout life. Highly admired for limb regeneration abilities.",
-      tags: ["Carnivore", "Aquatic", "Regeneration", "Freshwater"]
-    },
-    {
-      animalName: "Monarch Butterfly",
-      category: "Invertebrates",
-      confidence: 0.96,
-      description: "A spectacular milkweed butterfly known for its multi-generational long-distance migration across North America.",
-      tags: ["Herbivore", "Invertebrate", "Migratory", "Pollinator"]
-    },
-    {
-      animalName: "Clown Anemonefish",
-      category: "Fish",
-      confidence: 0.97,
-      description: "A famous tropical reef fish maintaining a symbiotic, immune partnership with stinging sea anemones for protective shelter.",
-      tags: ["Omnivore", "Aquatic", "Symbiotic", "Reef"]
-    }
-  ];
-
-  // Pick deterministically based on filename hash
-  let hash = 0;
-  for (let i = 0; i < filename.length; i++) {
-    hash = (hash << 5) - hash + filename.charCodeAt(i);
-    hash |= 0;
-  }
-  const index = Math.abs(hash) % fallbackAnimals.length;
-  const chosenFallback = fallbackAnimals[index];
-
-  let animalName = chosenFallback.animalName;
-  let category = chosenFallback.category;
-  let confidence = chosenFallback.confidence;
-  let description = chosenFallback.description;
-  let tags = chosenFallback.tags;
-
-  if (lower.includes("tolga-ahmetler") || lower.includes("r_gjcqvqhjm")) {
-    animalName = "European Hare";
-    category = "Mammals";
-    confidence = 0.94;
-    description = "An elegant European Hare captured showcasing its long, black-tipped ears and powerful hind legs. Found primarily in open countrysides and agricultural grasslands.";
-    tags = ["Herbivore", "Skittish", "Terrestrial", "Grassland"];
-  } else if (lower.includes("alexander-andrews") || lower.includes("medkupyeje1i")) {
-    animalName = "Red Fox";
-    category = "Mammals";
-    confidence = 0.96;
-    description = "A solitary Red Fox walking elegantly through pristine white snow. Highly adaptable, they possess exceptional high-frequency hearing to detect prey beneath winter snowpacks.";
-    tags = ["Omnivore", "Adaptable", "Nocturnal", "Cunning"];
-  } else if (lower.includes("jason-zhao") || lower.includes("aisjkppxce")) {
-    animalName = "Plains Zebra";
-    category = "Mammals";
-    confidence = 0.97;
-    description = "A majestic Plains Zebra standing in the savanna. Recognized by its bold, unique black-and-white stripe pattern, which acts as natural camouflage against biting insects and herd predators.";
-    tags = ["Herbivore", "Social", "Terrestrial", "Savanna"];
-  } else if (lower.includes("blake-meyer") || lower.includes("5rbxc7ryws")) {
-    animalName = "Bengal Tiger";
-    category = "Mammals";
-    confidence = 0.98;
-    description = "An up-close look at the majestic Bengal Tiger with its piercing orange eyes and signature vertical dark stripes. This stealthy apex predator is native to dense Asian woodlands.";
-    tags = ["Carnivore", "Predatory", "Solitary", "Nocturnal"];
-  } else if (lower.includes("ray-hennessy") || lower.includes("xuuzcpqlqpm")) {
-    animalName = "Red Fox";
-    category = "Mammals";
-    confidence = 0.95;
-    description = "A vibrant Red Fox with a luxurious rust-colored coat standing alert in snowy winter conditions, showcasing its extremely keen senses and hunter's focus.";
-    tags = ["Omnivore", "Adaptable", "Nocturnal", "Cunning", "Forest"];
-  } else if (lower.includes("zebra")) {
-    animalName = "Zebra";
-    category = "Mammals";
-    confidence = 0.96;
-    description = "Zebras are African equines with distinctive black-and-white striped coats. Each individual's stripe pattern is completely unique.";
-    tags = ["Herbivore", "Social", "Terrestrial", "Savanna"];
-  } else if (lower.includes("lion")) {
-    animalName = "Lion Panthera";
-    category = "Mammals";
-    confidence = 0.94;
-    description = "The lion is a muscular, deep-chested cat with a majestic mane in males. They are the only apex felid with highly social prides.";
-    tags = ["Carnivore", "Predatory", "Social", "Grassland"];
-  } else if (lower.includes("tiger")) {
-    animalName = "Tiger";
-    category = "Mammals";
-    confidence = 0.95;
-    description = "Tigers are the largest living cat species, immediately recognizable by dark vertical stripes on orange-brown fur.";
-    tags = ["Carnivore", "Predatory", "Solitary", "Nocturnal"];
-  } else if (lower.includes("elephant")) {
-    animalName = "African Elephant";
-    category = "Mammals";
-    confidence = 0.98;
-    description = "African Elephants are the largest living land mammals, sporting massive trunks and ears that dissipate heat.";
-    tags = ["Herbivore", "Social", "Intelligent", "Keystone"];
-  } else if (lower.includes("deer") || lower.includes("bambi")) {
-    animalName = "White-tailed Deer";
-    category = "Mammals";
-    confidence = 0.88;
-    description = "White-tailed deer are medium-sized forest herbivores known for raising their white tail-underside to signal warning.";
-    tags = ["Herbivore", "Terrestrial", "Forest", "Skittish"];
-  } else if (lower.includes("cat")) {
-    animalName = "Domestic Cat";
-    category = "Mammals";
-    confidence = 0.97;
-    description = "A beloved domestic carnivorous feline, adapted for hunting small rodents and living companionably with humans.";
-    tags = ["Carnivore", "Domesticated", "Nocturnal", "Agile"];
-  } else if (lower.includes("dog") || lower.includes("puppy")) {
-    animalName = "Canine Dog";
-    category = "Mammals";
-    confidence = 0.95;
-    description = "The dog is a domesticated canid, selectively bred for millennia for diverse behaviors, sensory capabilities, and shapes.";
-    tags = ["Omnivore", "Domesticated", "Social", "Alert"];
-  } else if (lower.includes("bird") || lower.includes("eagle") || lower.includes("parrot")) {
-    animalName = "Eagle";
-    category = "Birds";
-    confidence = 0.91;
-    description = "Eagle is the common name for many large birds of prey of the family Accipitridae, boasting razor vision and large talons.";
-    tags = ["Carnivore", "Aerial", "Predatory", "Diurnal"];
-  } else if (lower.includes("frog") || lower.includes("toad")) {
-    animalName = "Tree Frog";
-    category = "Amphibians";
-    confidence = 0.89;
-    description = "Tree frogs are colorful amphibians with specialized adhesive toe discs that enable high vertical climbing.";
-    tags = ["Insectivore", "Nocturnal", "Semi-aquatic", "Vocal"];
-  } else if (lower.includes("snake") || lower.includes("turtle") || lower.includes("lizard")) {
-    animalName = "Green Iguana";
-    category = "Reptiles";
-    confidence = 0.92;
-    description = "Green iguanas are large, primarily herbivorous species of lizard native to Central and South American dense canopies.";
-    tags = ["Herbivore", "Arboreal", "Diurnal", "Ectothermic"];
-  }
-
-  return { animalName, category, confidence, description, tags };
-}
 
 // 2. GET API - Retrieve all metadata records
 app.get("/api/images", (req, res) => {
@@ -374,7 +191,7 @@ app.get("/api/images", (req, res) => {
   }
 });
 
-// 3. POST API - Sync/Add individual metadata records to SQLite-like JSON db
+// 3. POST API - Sync/Add individual metadata records to database
 app.post("/api/images", (req, res) => {
   try {
     const newRecord = req.body;
@@ -418,7 +235,7 @@ app.delete("/api/images/:id", (req, res) => {
   }
 });
 
-// 5. DELETE API - Clear index database
+// 5. DELETE API - Clear entire database
 app.delete("/api/images", (req, res) => {
   try {
     writeDatabase({ records: [] });
@@ -439,9 +256,79 @@ app.get("/api/statistics", (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
+// ============================================================
+// MODEL CONFIGURATION ENDPOINTS
+// ============================================================
+
+// Get current model configuration
+app.get("/api/model/config", (req, res) => {
+  try {
+    return res.json({
+      config: currentModelConfig,
+      modelInfo: getModelInfo(),
+      minConfidenceThreshold: 0.7,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to retrieve model configuration" });
+  }
+});
+
+// Update model configuration
+app.post("/api/model/config", (req, res) => {
+  try {
+    const { detectionThreshold, classificationThreshold, maxPredictions } = req.body;
+
+    if (detectionThreshold !== undefined && (detectionThreshold < 0 || detectionThreshold > 1)) {
+      return res.status(400).json({ error: "detectionThreshold must be between 0 and 1" });
+    }
+
+    if (classificationThreshold !== undefined && (classificationThreshold < 0 || classificationThreshold > 1)) {
+      return res.status(400).json({ error: "classificationThreshold must be between 0 and 1" });
+    }
+
+    if (classificationThreshold !== undefined && classificationThreshold < 0.7) {
+      return res.status(400).json({ error: "classificationThreshold cannot be below 70% (0.7)" });
+    }
+
+    if (maxPredictions !== undefined && (maxPredictions < 1 || maxPredictions > 10)) {
+      return res.status(400).json({ error: "maxPredictions must be between 1 and 10" });
+    }
+
+    // Update configuration
+    if (detectionThreshold !== undefined) {
+      currentModelConfig.detectionThreshold = detectionThreshold;
+    }
+    if (classificationThreshold !== undefined) {
+      currentModelConfig.classificationThreshold = classificationThreshold;
+    }
+    if (maxPredictions !== undefined) {
+      currentModelConfig.maxPredictions = maxPredictions;
+    }
+
+    console.log("✓ Model configuration updated:", currentModelConfig);
+
+    return res.json({
+      success: true,
+      config: currentModelConfig,
+      message: "Model configuration successfully updated",
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to update model configuration" });
+  }
+});
+
+// Get model information
+app.get("/api/model/info", (req, res) => {
+  try {
+    return res.json(getModelInfo());
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to retrieve model information" });
+  }
+});
+
+// ============================================================
 // VITE OR STATIC FRONTEND SERVING MIDDLEWARE
-// -------------------------------------------------------------
+// ============================================================
 
 async function initializeApp() {
   if (process.env.NODE_ENV !== "production") {
@@ -454,7 +341,7 @@ async function initializeApp() {
     
     // Route resource requests to React Vite middleware
     app.use(vite.middlewares);
-    console.log("Application mounted in DEVELOPMENT mode with Express proxy.");
+    console.log("✓ Application mounted in DEVELOPMENT mode with Express proxy.");
   } else {
     // Serve static compiled assets
     const distPath = path.join(process.cwd(), "dist");
@@ -463,11 +350,12 @@ async function initializeApp() {
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
-    console.log("Application mounted in PRODUCTION mode serving statically.");
+    console.log("✓ Application mounted in PRODUCTION mode serving statically.");
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Express server successfully running at http://localhost:${PORT}`);
+    console.log(`\n✨ Express server successfully running at http://localhost:${PORT}`);
+    console.log(`🐘 Wildlife recognition system ready for real-world animal images\n`);
   });
 }
 

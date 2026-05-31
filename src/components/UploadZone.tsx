@@ -4,7 +4,7 @@
  */
 
 import React, { useRef, useState, DragEvent, ChangeEvent } from "react";
-import { Upload, FolderPlus, Play, Pause, XCircle, FileImage, ShieldAlert } from "lucide-react";
+import { Upload, FolderPlus, Play, Pause, XCircle, FileImage, ShieldAlert, Info } from "lucide-react";
 import { AnimalRecord } from "../types";
 
 interface UploadZoneProps {
@@ -233,15 +233,18 @@ export default function UploadZone({
         const completeRecord: AnimalRecord = {
           id: currentItem.id,
           imageName: currentItem.file.name,
-          animalName: classification.animalName || "Unknown",
-          category: classification.category || "Mammals",
-          confidence: classification.confidence != null ? classification.confidence : 0.85,
+          animalName: classification.animalName || "Unknown Animal",
+          category: classification.category || "Unknown",
+          confidence: classification.confidence != null ? classification.confidence : 0,
           uploadDate: new Date().toISOString(),
-          thumbnailUrl: thumbResult.dataUrl, // ultra-small compressed thumbnail Base64 (10-15KB)
+          thumbnailUrl: thumbResult.dataUrl,
           originalSize: currentItem.file.size,
           aspectRatio: classifierResult.width / classifierResult.height,
           description: classification.description,
           tags: classification.tags || [],
+          detections: classification.detections,
+          predictions: classification.predictions,
+          modelVersion: classification.modelVersion,
         };
 
         // Notify parent grid to persist metadata and Blob
@@ -436,6 +439,18 @@ export default function UploadZone({
           </div>
         </div>
       )}
+
+      {/* System Information Banner */}
+      <div className="p-4 border border-blue-500/20 bg-blue-500/5 rounded-xl flex gap-3">
+        <Info className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
+        <div className="text-xs">
+          <p className="font-semibold text-blue-100 mb-1">🚀 Production Animal Recognition System</p>
+          <p className="text-blue-200">
+            Using YOLOv8 for detection + EfficientNet-B7 for classification. 
+            Classification requires ≥70% confidence to be valid. Images below threshold are marked "Unknown Animal".
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
