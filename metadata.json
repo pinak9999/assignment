@@ -1,0 +1,6 @@
+{
+  "name": "Animal Recognition Web Application",
+  "description": "An AI-powered web application that processes large quantities of uploaded animal images, detects animal species using Gemini models, stores metadata, and provides a premium analytics dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
